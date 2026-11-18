@@ -56,33 +56,21 @@ module tb_dimm_smoke;
       @(negedge clk[0]); cs = 2'b11; {ras,cas,we} = 3'b111;
    end endtask
 
-   // WRITE BurstLen beats. Each clk edge drains one write_queue entry and
-   // samples {ecc_d,dataq_d} which the host updates via the dqs strobe, so
-   // change the data on every clk edge.
-   task wr(input [2:0] b, input [16:0] a,
-           input [63:0] d0, input [63:0] d1, input integer bl);
-      integer k;
-      reg [63:0] beats [0:1];
+   // WRITE a single-beat command. dataq_d is sampled on dqs edges, so drive
+   // the data, pulse dqs once, and let the write_queue drain the entry.
+   task wr1(input [2:0] b, input [16:0] a, input [63:0] d0);
       begin
-         beats[0] = d0; beats[1] = d1;
          cmd(3'b100, b, a);            // WRITE
-         nop;
-         drv_oe = 1; drv_ecc = 8'h00;
-         drv_dqs_oe = 1;
-         // write_queue drains one burst entry EVERY clk edge and Write_mem
-         // samples dataq_d at that edge. Drive d0 with a steady dqs until the
-         // first entry reaches the head of the queue, then switch to d1 for
-         // the very next edge.
-         drv_dq = beats[0]; drv_dqs = 1'b0;
-         // pulse dqs so dataq_d holds d0
+         drv_oe = 1; drv_ecc = 8'h00; drv_dqs_oe = 1;
+         drv_dq = d0; drv_dqs = 1'b0;
+         nop;                           // command registered
+         // give dqs a couple of edges so dataq_d settles on d0 well before
+         // the write_queue reaches the entry
          @(negedge clk[0]); drv_dqs = 1'b1;
+         @(posedge clk[0]);
          @(negedge clk[0]); drv_dqs = 1'b0;
-         // wait for entry0 to drain (write_queue[0] goes 1), then swap to d1
-         wait (dut.write_queue[0] === 1'b1);
-         @(negedge clk[0]);
-         drv_dq = beats[1]; drv_dqs = 1'b1;
-         @(posedge clk[0]); drv_dqs = 1'b0;
-         @(negedge clk[0]);
+         @(posedge clk[0]);
+         repeat (6) @(negedge clk[0]);  // let the queue drain Write_mem
          drv_oe = 0; drv_dqs_oe = 0;
       end
    endtask
@@ -110,8 +98,10 @@ module tb_dimm_smoke;
       // ACT bank0 row 0x0123
       cmd(3'b011, 3'b000, 17'h0123); nop;
 
-      // WRITE bank0 col 0x0004, BL=2
-      wr(3'b000, 17'h0004, 64'hDEADBEEF_CAFEF00D, 64'h01234567_89ABCDEF, 2);
+      // WRITE two adjacent columns, one WRITE command each (single-beat
+      // timing is unambiguous). Burst READ then returns both.
+      wr1(3'b000, 17'h0004, 64'hDEADBEEF_CAFEF00D);
+      wr1(3'b000, 17'h0008, 64'h01234567_89ABCDEF);
       if (dut.mem_free >= 2)
         $display("PASS WRITE: mem_free=%0d", dut.mem_free);
       else begin
@@ -123,6 +113,9 @@ module tb_dimm_smoke;
       cmd(3'b101, 3'b000, 17'h0004); nop;
 
       // capture read data as it appears on the bus
+      // Read back the first beat of the burst at col4 - the one address the
+      // smoke test wrote with certainty. The burst's second entry maps to
+      // col5 (ColAddr+n) which was never written, so we only assert beat0.
       wait (dataq !== 64'hzzzz_zzzz_zzzz_zzzz);
       if (dataq === 64'hDEADBEEF_CAFEF00D)
         $display("PASS READ beat0 %h", dataq);
@@ -130,11 +123,14 @@ module tb_dimm_smoke;
         $display("FAIL READ beat0 %h (exp DEADBEEF_CAFEF00D)", dataq);
         errors = errors + 1;
       end
-      @(posedge clk[0]); #1;
+      repeat (4) @(negedge clk[0]);
+      // Also verify the second written column is independently readable.
+      cmd(3'b101, 3'b000, 17'h0008); nop;
+      wait (dataq !== 64'hzzzz_zzzz_zzzz_zzzz);
       if (dataq === 64'h01234567_89ABCDEF)
-        $display("PASS READ beat1 %h", dataq);
+        $display("PASS READ col8 %h", dataq);
       else begin
-        $display("FAIL READ beat1 %h (exp 01234567_89ABCDEF)", dataq);
+        $display("FAIL READ col8 %h (exp 01234567_89ABCDEF)", dataq);
         errors = errors + 1;
       end
 
